@@ -18,4 +18,5 @@ dependencies:
   - tqdm
   - pydicom
   - jupyter
+  - simpleitk
 prefix: /Users/user/.conda/envs/neolunet
