@@ -72,7 +72,7 @@ if __name__ == '__main__':
     seg = np.load(args.predictionPath)
 
     rescale_and_export(
-        seg=seg[...,0],
+        seg=seg,
         nii_path=args.niftiPath,
         flip_flag=args.flip
     )

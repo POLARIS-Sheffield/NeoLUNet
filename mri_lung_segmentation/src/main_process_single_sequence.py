@@ -14,7 +14,7 @@ arguments:
                         Threshold value for predictions.
 """
 
-# use a different approach to sort filenames
+# NJS: use a different approach to sort filenames
 import re
 import glob
 
@@ -25,20 +25,16 @@ import pandas as pd
 import tensorflow as tf
 from pydicom import dcmread
 from matplotlib import pyplot as plt
-from DL_utils.model2D import unet2D
 
 from skimage.transform import rescale
 
+import SimpleITK
+
 import segmentation_utils
 import lung_volume_utils
+from DL_utils.model2D import unet2D
 
-def segmentation_volume_pipeline(
-    data_path,
-    patient_id,
-    models_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'models', 'all_pat'),
-    size=128,
-    cut_off=0.5
-):
+def load_dicoms(data_path):
     # Load DICOM MRI Sequence
     patient_image_array = []
     # NJS: Change the method used for sorting DICOMs
@@ -52,8 +48,55 @@ def segmentation_volume_pipeline(
         image_array_tf = tf.expand_dims(image_array, axis=-1)
         patient_image_array.append(image_array_tf)
 
-    # resize to target
     patient_image_array = np.array(patient_image_array)
+
+    # Load DICOM Metadata
+    meta_dict = {
+            "x_spacing" : dicom_sequence.PixelSpacing[0],
+            "y_spacing" : dicom_sequence.PixelSpacing[1],
+            "slice_thickness" : dicom_sequence.SliceThickness,
+            "spacing_between_slices" : dicom_sequence.SpacingBetweenSlices
+            }
+
+    return patient_image_array, meta_dict
+
+def load_image(data_path):
+    im_sitk = SimpleITK.ReadImage(data_path)
+    image_array = SimpleITK.GetArrayFromImage(im_sitk)
+
+    patient_image_array = []
+    for i_ind in range(image_array.shape[0]):
+        # add channels dim
+        image_array_tf = tf.expand_dims(image_array[i_ind,:,:], axis=-1)
+        patient_image_array.append(image_array_tf)
+
+    patient_image_array = np.array(patient_image_array)
+
+    meta_dict = {
+            "x_spacing" : im_sitk.GetSpacing()[0],
+            "y_spacing" : im_sitk.GetSpacing()[1],
+            "slice_thickness" : im_sitk.GetSpacing()[2],
+            "spacing_between_slices" : im_sitk.GetSpacing()[2]
+            }
+    return patient_image_array, meta_dict
+
+
+def segmentation_volume_pipeline(
+    data_path,
+    patient_id,
+    output_dir,
+    models_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'models', 'all_pat'),
+    size=128,
+    cut_off=0.5,
+    output_measures=False
+):
+    # NJS: check if path to image or directory of DICOMs
+    if os.path.isdir(data_path):
+        # Assume this is the path to DICOMs
+        patient_image_array, meta_dict = load_dicoms(data_path)
+    elif os.path.isfile(data_path):
+        # Assume mha or nii
+        patient_image_array, meta_dict = load_image(data_path)
 
     # Create Empty model
     segmentation_models = [unet2D(None, (size, size, 1), 1, "binary_crossentropy")]*3
@@ -85,50 +128,56 @@ def segmentation_volume_pipeline(
     cropped_images_tf = tf.expand_dims(cropped_images, axis=-1)
 
     prediction = segmentation_utils.gen_maj_pred_of_images(segmentation_models, cropped_images_tf, cut_off)
-    # Plot predicted masks
-    assert len(cropped_images)==len(prediction)
-    plot_save_path = os.path.join(data_path, 'plots')
-    if not os.path.exists(plot_save_path):
-        os.mkdir(plot_save_path)
-    for i in range(len(cropped_images)):
-        fig, axs = plt.subplots(ncols=2, figsize=(10, 5))
-        axs[0].imshow(cropped_images[i, :, :], cmap='bone', aspect='auto')
-        axs[1].imshow(prediction[i, :, :, 0], cmap='bone', aspect='auto')
-        plt.savefig(os.path.join(plot_save_path, f'{patient_id}_{i:02d}.png'), dpi=100)
-        plt.close()
 
-    # Save predictions:
-    pred_save_path = os.path.join(data_path, 'predictions')
-    if not os.path.exists(pred_save_path):
-        os.mkdir(pred_save_path)
-    with open(os.path.join(pred_save_path, f'{patient_id}.npy'), 'wb') as f:
-        np.save(f, prediction)
+    if not os.path.exists(output_dir):
+        os.mkdir(output_dir)
 
-    # Load DICOM Metadata
-    x_spacing = dicom_sequence.PixelSpacing[0]
-    y_spacing = dicom_sequence.PixelSpacing[1]
-    slice_thickness = dicom_sequence.SliceThickness
-    spacing_between_slices = dicom_sequence.SpacingBetweenSlices
-    # Calculate volume
-    object_3d = lung_volume_utils.gen_3d_object_from_numpy(prediction, slice_thickness, spacing_between_slices)
-    left_volume, right_volume, silhouette = lung_volume_utils.calculate_left_and_right_volume(object_3d, x_spacing, y_spacing)
-    overall_volume = lung_volume_utils.calculate_volume(object_3d, x_spacing, y_spacing)
+    # Save predictions as npy array
+    with open(os.path.join(output_dir, f'{patient_id}.npy'), 'wb') as f:
+        np.save(f, prediction[...,0])
 
-    # Save extracted features:
-    feature_df = pd.DataFrame({
-        'patient_id': [patient_id],
-        'left_vol': [left_volume],
-        'right_vol': [right_volume],
-        'overall_vol': [overall_volume]
-    })
-    feature_save_path = os.path.join(data_path, 'extracted_features')
-    if not os.path.exists(feature_save_path):
-        os.mkdir(feature_save_path)
-    feature_df.to_csv(os.path.join(feature_save_path, f'{patient_id}.csv'), index=False)
+    # If mha or nii, save prediction in the same format
+    if os.path.isfile(data_path):
+        # rescale here
+        output_seg = np.zeros(standardized_images[...,0].shape)
+        for i_ind in range(output_seg.shape[0]):
+            output_seg[i_ind, :, :] = rescale(prediction[i_ind, :, :, 0].astype(bool), scale_factor, order=0)
 
-    print('left_volume', left_volume)
-    print('right_volume', right_volume)
-    print('overall_volume', overall_volume)
+        output_seg[output_seg>0] = 1
+
+        # Write out segmentation here
+        im_sitk = SimpleITK.ReadImage(data_path)
+        output_seg_sitk = SimpleITK.GetImageFromArray(output_seg)
+        output_seg_sitk.CopyInformation(im_sitk)
+        SimpleITK.WriteImage(output_seg_sitk, os.path.join(output_dir,f'lungSeg_{os.path.basename(data_path)}'))
+
+    # Optional: Plot predicted masks, calculate statistics and save pngs
+    if output_measures:
+        assert len(cropped_images)==len(prediction)
+        for i in range(len(cropped_images)):
+            fig, axs = plt.subplots(ncols=2, figsize=(10, 5))
+            axs[0].imshow(cropped_images[i, :, :], cmap='bone', aspect='auto')
+            axs[1].imshow(prediction[i, :, :, 0], cmap='bone', aspect='auto')
+            plt.savefig(os.path.join(output_dir, f'{patient_id}_{i:02d}.png'), dpi=100)
+            plt.close()
+
+        # Calculate volume
+        object_3d = lung_volume_utils.gen_3d_object_from_numpy(prediction, meta_dict["slice_thickness"], meta_dict["spacing_between_slices"])
+        left_volume, right_volume, silhouette = lung_volume_utils.calculate_left_and_right_volume(object_3d, meta_dict["x_spacing"], meta_dict["y_spacing"])
+        overall_volume = lung_volume_utils.calculate_volume(object_3d, meta_dict["x_spacing"], meta_dict["y_spacing"])
+
+        # Save extracted features:
+        feature_df = pd.DataFrame({
+            'patient_id': [patient_id],
+            'left_vol': [left_volume],
+            'right_vol': [right_volume],
+            'overall_vol': [overall_volume]
+        })
+        feature_df.to_csv(os.path.join(output_dir, f'{patient_id}.csv'), index=False)
+
+        print('left_volume', left_volume)
+        print('right_volume', right_volume)
+        print('overall_volume', overall_volume)
 
 
 def main():
@@ -136,8 +185,8 @@ def main():
     parser = argparse.ArgumentParser(description="Perform Segmentations and Calculate Volume for One MRI Sequence",
                                      formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument(
-        '-i', '--imagesDir',
-        help='Path to the folder with patient data',
+        '-i', '--imageSrc',
+        help='Path to mha / nii file, or folder with DICOM data',
         type=str,
         default=None,
         required=True,
@@ -149,6 +198,14 @@ def main():
         type=str,
         default=None,
         required=True,
+    )
+    # NJS: add outputDir optional argument
+    parser.add_argument(
+        '-o', '--outputDir',
+        help='Output directory - will be the same as input directory by default',
+        type=str,
+        default=None,
+        required=False,
     )
     parser.add_argument(
         '-m', '--modelDir',
@@ -166,15 +223,24 @@ def main():
         help='Threshold value for predictions',
         default=0.5,
         type=int)
+    # NJS: add optional argument to disable production of PNGs and output metrics
+    parser.add_argument(
+        '-t', '--outputMeasures',
+        help='Flag to output PNGs of the prediction for each slice',
+        default=False,
+        required=False,
+        type=bool)
     args = parser.parse_args()
 
     # Segment the lung and calculate the volumes
     segmentation_volume_pipeline(
-        data_path=args.imagesDir,
+        data_path=args.imageSrc,
         patient_id=args.patientID,
+        output_dir=args.outputDir,
         models_path=args.modelDir,
         size=args.size,
-        cut_off=args.cutOff
+        cut_off=args.cutOff,
+        output_measures=args.outputMeasures
     )
 
 
